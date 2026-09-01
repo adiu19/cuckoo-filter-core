@@ -1,0 +1,11 @@
+[package]
+name = "cuckoo-filter-core"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "Cuckoo filter with deterministic layout and a stable serialization format"
+repository = "https://github.com/adiu19/cuckoo-filter-core"
+keywords = ["cuckoo", "filter", "probabilistic", "bloom"]
+categories = ["data-structures"]
+
+[dependencies]
