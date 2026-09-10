@@ -9,3 +9,4 @@ keywords = ["cuckoo", "filter", "probabilistic", "bloom"]
 categories = ["data-structures"]
 
 [dependencies]
+siphasher = "1.0.3"
