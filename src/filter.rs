@@ -331,4 +331,32 @@ mod tests {
             assert!(cf8.contains(&item.to_le_bytes()));
         }
     }
+
+    #[test]
+    fn identical_sequences_produce_identical_tables() {
+        let mut cf = CuckooFilter::with_seed_fp8(256, 4, 100, SEED).unwrap();
+        let mut cf_alt = CuckooFilter::with_seed_fp8(256, 4, 100, SEED).unwrap();
+
+        let mut failed = 0;
+        for item in 0u64..300 {
+            let ra = cf.insert(&item.to_le_bytes());
+            let rb = cf_alt.insert(&item.to_le_bytes());
+
+            assert_eq!(ra.is_ok(), rb.is_ok(), "diverged at item {item}");
+
+            if ra.is_err() {
+                failed += 1;
+            }
+        }
+
+        assert!(failed > 0, "expected saturation");
+
+        let (CuckooFilter(Inner::Fp8(fa)), CuckooFilter(Inner::Fp8(fb))) = (&cf, &cf_alt) else {
+            unreachable!()
+        };
+
+        assert_eq!(fa.table, fb.table);
+        assert_eq!(fa.victim, fb.victim);
+        assert_eq!(fa.num_items, fb.num_items);
+    }
 }
