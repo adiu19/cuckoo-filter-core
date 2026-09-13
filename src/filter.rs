@@ -80,6 +80,14 @@ impl CuckooFilter {
     }
 
     #[must_use]
+    pub fn count(&self, item: &[u8]) -> usize {
+        match self {
+            CuckooFilter(Inner::Fp8(f)) => f.count(item),
+            CuckooFilter(Inner::Fp16(f)) => f.count(item),
+        }
+    }
+
+    #[must_use]
     pub fn len(&self) -> usize {
         match self {
             CuckooFilter(Inner::Fp8(f)) => f.num_items,
@@ -205,6 +213,13 @@ impl<F: Fingerprint> Filter<F> {
         self.table[self.bucket_range(bucket_idx)].contains(&fp)
     }
 
+    fn bucket_count(&self, bucket_idx: usize, fp: F) -> usize {
+        self.table[self.bucket_range(bucket_idx)]
+            .iter()
+            .filter(|&&f| f == fp)
+            .count()
+    }
+
     fn bucket_insert(&mut self, bucket_idx: usize, fp: F) -> bool {
         for i in self.bucket_range(bucket_idx) {
             if self.table[i] == F::EMPTY {
@@ -269,6 +284,16 @@ impl<F: Fingerprint> Filter<F> {
         }
     }
 
+    fn matches_victim(&self, i1: usize, i2: usize, fp: F) -> bool {
+        if let Some((vb, vfp)) = self.victim {
+            if vfp == fp && (i1 == vb || i2 == vb) {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Removes one copy of item fingerprint, checking the victim slot, then
     /// bucket i1, then i2 (fixed order, determinism requires it). Returns whether
     /// a matching fingerprint was found and removed.
@@ -283,12 +308,10 @@ impl<F: Fingerprint> Filter<F> {
         let (i1, i2, fp) = self.probe(item);
 
         // victim has what we need
-        if let Some((victim_i1, victim_fp)) = self.victim {
-            if victim_fp == fp && (i1 == victim_i1 || i2 == victim_i1) {
-                self.num_items -= 1;
-                self.victim = None;
-                return true;
-            }
+        if self.matches_victim(i1, i2, fp) {
+            self.num_items -= 1;
+            self.victim = None;
+            return true;
         }
 
         // one of i1 and i2 have what we need
@@ -319,13 +342,21 @@ impl<F: Fingerprint> Filter<F> {
         let (i1, i2, fp) = self.probe(item);
 
         // victim check
-        if let Some((vb, vfp)) = self.victim {
-            if vfp == fp && (vb == i1 || vb == i2) {
-                return true;
-            }
+        if self.matches_victim(i1, i2, fp) {
+            return true;
         }
 
         self.bucket_contains(i1, fp) || self.bucket_contains(i2, fp)
+    }
+
+    fn count(&self, item: &[u8]) -> usize {
+        let (i1, i2, fp) = self.probe(item);
+        let mut res = usize::from(self.matches_victim(i1, i2, fp));
+        res += self.bucket_count(i1, fp);
+        if i1 != i2 {
+            res += self.bucket_count(i2, fp);
+        }
+        res
     }
 
     #[cfg(test)]
@@ -374,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn u8_insert_bucketsize_2() {
+    fn u8_insert_b2() {
         let mut cf8 = CuckooFilter::with_seed_fp8(8, 2, 2, SEED).unwrap();
 
         // fill upto 75%
@@ -390,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn u8_insert_bucketsize_4() {
+    fn u8_insert_b4() {
         let mut cf8 = CuckooFilter::with_seed_fp8(8, 4, 2, SEED).unwrap();
 
         // fill upto 75%
@@ -406,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn u8_delete_bucketsize_4() {
+    fn u8_delete_b4() {
         let mut cf8 = CuckooFilter::with_seed_fp8(8, 4, 2, SEED).unwrap();
 
         // fill upto 75%
@@ -425,6 +456,30 @@ mod tests {
         for item in 3u64..7u64 {
             assert!(cf8.contains(&item.to_le_bytes()));
         }
+    }
+
+    #[test]
+    fn u8_count_b4() {
+        let mut cf8 = CuckooFilter::with_seed_fp8(8, 4, 2, SEED).unwrap();
+
+        // insert 1u64 4 times
+        let item = 1u64.to_le_bytes();
+        for _ in 0..4 {
+            assert!(cf8.insert(&item).is_ok());
+        }
+
+        assert_eq!(4, cf8.len());
+        assert_eq!(4, cf8.count(&item));
+
+        for _ in 0..2 {
+            assert!(cf8.delete(&item));
+        }
+
+        assert_eq!(2, cf8.len());
+        assert_eq!(2, cf8.count(&item));
+
+        // 2u64 is never inserted, so it's count should be 0
+        assert_eq!(0, cf8.count(&2u64.to_le_bytes()));
     }
 
     #[test]
