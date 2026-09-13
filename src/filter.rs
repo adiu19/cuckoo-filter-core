@@ -72,6 +72,14 @@ impl CuckooFilter {
         }
     }
 
+    pub fn delete(&mut self, item: &[u8]) -> bool {
+        match self {
+            CuckooFilter(Inner::Fp8(f)) => f.delete(item),
+            CuckooFilter(Inner::Fp16(f)) => f.delete(item),
+        }
+    }
+
+    #[must_use]
     pub fn len(&self) -> usize {
         match self {
             CuckooFilter(Inner::Fp8(f)) => f.num_items,
@@ -79,10 +87,12 @@ impl CuckooFilter {
         }
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    #[must_use]
     pub fn contains(&self, item: &[u8]) -> bool {
         match self {
             CuckooFilter(Inner::Fp8(f)) => f.contains(item),
@@ -166,14 +176,14 @@ impl<F: Fingerprint> Filter<F> {
 
     fn index1(&self, h: u64) -> usize {
         // index uses bits DISJOINT from the fingerprint's low 16
-        (h >> 16) as usize & (self.bucket_count - 1)
+        ((h >> 16) & (self.bucket_count as u64 - 1)) as usize
     }
 
     fn alt_index(&self, i: usize, fp: F) -> usize {
         // paper Eq.(2): hash the fingerprint before XOR so displaced items
         // spread across the whole table, not a 2^16 neighborhood
         let h = fp.to_u64().wrapping_mul(0x5bd1_e995); //  0x5bd1e995 is the mixing constant from MurmurHash2
-        i ^ (h as usize & (self.bucket_count - 1))
+        i ^ ((h & (self.bucket_count as u64 - 1)) as usize)
     }
 
     fn bucket_contains(&self, bucket_idx: usize, fp: F) -> bool {
@@ -186,6 +196,18 @@ impl<F: Fingerprint> Filter<F> {
         for i in start..start + self.bucket_size {
             if self.table[i] == F::EMPTY {
                 self.table[i] = fp;
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn bucket_remove(&mut self, bucket_idx: usize, fp: F) -> bool {
+        let start = bucket_idx * self.bucket_size;
+        for i in start..start + self.bucket_size {
+            if self.table[i] == fp {
+                self.table[i] = F::EMPTY;
                 return true;
             }
         }
@@ -225,6 +247,50 @@ impl<F: Fingerprint> Filter<F> {
 
         self.victim = Some((target_bid, orphan));
         Ok(())
+    }
+
+    fn try_rehome_victim(&mut self) {
+        if let Some((vb, vfp)) = self.victim {
+            if self.bucket_insert(vb, vfp) || self.bucket_insert(self.alt_index(vb, vfp), vfp) {
+                self.victim = None;
+            }
+        }
+    }
+
+    /// Removes one copy of item fingerprint, checking the victim slot, then
+    /// bucket i1, then i2 (fixed order, determinism requires it). Returns whether
+    /// a matching fingerprint was found and removed.
+    ///
+    /// After a successful table removal, a parked victim is re-homed into its own
+    /// two buckets if space opened up.
+    ///
+    /// Deleting an item that was never inserted may remove a colliding item's
+    /// entry and introduce a false negative: only delete items known to have been
+    /// inserted.
+    fn delete(&mut self, item: &[u8]) -> bool {
+        let h = self.hash(item);
+        let fp = self.fingerprint(h);
+
+        let i1 = self.index1(h);
+        let i2 = self.alt_index(i1, fp);
+
+        // victim has what we need
+        if let Some((victim_i1, victim_fp)) = self.victim {
+            if victim_fp == fp && (i1 == victim_i1 || i2 == victim_i1) {
+                self.num_items -= 1;
+                self.victim = None;
+                return true;
+            }
+        }
+
+        // one of i1 and i2 have what we need
+        if self.bucket_remove(i1, fp) || self.bucket_remove(i2, fp) {
+            self.num_items -= 1;
+            self.try_rehome_victim();
+            return true;
+        }
+
+        false
     }
 
     fn insert(&mut self, item: &[u8]) -> Result<(), Full> {
@@ -333,6 +399,28 @@ mod tests {
     }
 
     #[test]
+    fn u8_delete_bucketsize_4() {
+        let mut cf8 = CuckooFilter::with_seed_fp8(8, 4, 2, SEED).unwrap();
+
+        // fill upto 75%
+        for item in 1u64..7u64 {
+            assert!(cf8.insert(&item.to_le_bytes()).is_ok());
+        }
+
+        assert_eq!(6, cf8.len());
+
+        for item in 1u64..3u64 {
+            assert!(cf8.delete(&item.to_le_bytes()));
+        }
+
+        assert_eq!(4, cf8.len());
+
+        for item in 3u64..7u64 {
+            assert!(cf8.contains(&item.to_le_bytes()));
+        }
+    }
+
+    #[test]
     fn identical_sequences_produce_identical_tables() {
         let mut cf = CuckooFilter::with_seed_fp8(256, 4, 100, SEED).unwrap();
         let mut cf_alt = CuckooFilter::with_seed_fp8(256, 4, 100, SEED).unwrap();
@@ -350,6 +438,21 @@ mod tests {
         }
 
         assert!(failed > 0, "expected saturation");
+
+        let (CuckooFilter(Inner::Fp8(fa)), CuckooFilter(Inner::Fp8(fb))) = (&cf, &cf_alt) else {
+            unreachable!()
+        };
+
+        assert_eq!(fa.table, fb.table);
+        assert_eq!(fa.victim, fb.victim);
+        assert_eq!(fa.num_items, fb.num_items);
+
+        for item in 0u64..50 {
+            let ra = cf.delete(&item.to_le_bytes());
+            let rb = cf_alt.delete(&item.to_le_bytes());
+
+            assert_eq!(ra, rb, "deletion diverged at item {item}");
+        }
 
         let (CuckooFilter(Inner::Fp8(fa)), CuckooFilter(Inner::Fp8(fb))) = (&cf, &cf_alt) else {
             unreachable!()
