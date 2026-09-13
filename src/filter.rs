@@ -11,10 +11,10 @@ pub enum BuildError {
     ZeroBucketSize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CuckooFilter(Inner);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Inner {
     Fp8(Filter<u8>),
     Fp16(Filter<u16>),
@@ -141,14 +141,14 @@ impl Fingerprint for u16 {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Filter<F> {
     table: Vec<F>, // F = fingerprint type, u8 or u16
     bucket_count: usize,
     bucket_size: usize,
     max_kicks: u32,
     seed: [u8; 16],             // hash key for determinism
-    num_items: usize,           // number of items in the filter
+    num_items: usize,           // logical membership count. Maintained only by insert/delete
     victim: Option<(usize, F)>, // displaced (bucket_index, fp) parked after a failed kick chain
 }
 
@@ -174,6 +174,21 @@ impl<F: Fingerprint> Filter<F> {
         F::from_hash(h)
     }
 
+    fn probe(&self, item: &[u8]) -> (usize, usize, F) {
+        let h = self.hash(item);
+        let fp = self.fingerprint(h);
+
+        let i1 = self.index1(h);
+        let i2 = self.alt_index(i1, fp);
+
+        (i1, i2, fp)
+    }
+
+    fn bucket_range(&self, i: usize) -> std::ops::Range<usize> {
+        let start = i * self.bucket_size;
+        start..start + self.bucket_size
+    }
+
     fn index1(&self, h: u64) -> usize {
         // index uses bits DISJOINT from the fingerprint's low 16
         ((h >> 16) & (self.bucket_count as u64 - 1)) as usize
@@ -187,13 +202,11 @@ impl<F: Fingerprint> Filter<F> {
     }
 
     fn bucket_contains(&self, bucket_idx: usize, fp: F) -> bool {
-        let start = bucket_idx * self.bucket_size;
-        self.table[start..start + self.bucket_size].contains(&fp)
+        self.table[self.bucket_range(bucket_idx)].contains(&fp)
     }
 
     fn bucket_insert(&mut self, bucket_idx: usize, fp: F) -> bool {
-        let start = bucket_idx * self.bucket_size;
-        for i in start..start + self.bucket_size {
+        for i in self.bucket_range(bucket_idx) {
             if self.table[i] == F::EMPTY {
                 self.table[i] = fp;
                 return true;
@@ -204,8 +217,7 @@ impl<F: Fingerprint> Filter<F> {
     }
 
     fn bucket_remove(&mut self, bucket_idx: usize, fp: F) -> bool {
-        let start = bucket_idx * self.bucket_size;
-        for i in start..start + self.bucket_size {
+        for i in self.bucket_range(bucket_idx) {
             if self.table[i] == fp {
                 self.table[i] = F::EMPTY;
                 return true;
@@ -216,8 +228,8 @@ impl<F: Fingerprint> Filter<F> {
     }
 
     fn bucket_displace(&mut self, bucket_idx: usize, fp: F, kick_id: u32) -> F {
-        let start = bucket_idx * self.bucket_size;
-        let candidate = start + (fp.to_u64() as usize + kick_id as usize) % self.bucket_size;
+        let range = self.bucket_range(bucket_idx);
+        let candidate = range.start + (fp.to_u64() as usize + kick_id as usize) % self.bucket_size;
 
         let orphan = self.table[candidate];
         self.table[candidate] = fp;
@@ -268,11 +280,7 @@ impl<F: Fingerprint> Filter<F> {
     /// entry and introduce a false negative: only delete items known to have been
     /// inserted.
     fn delete(&mut self, item: &[u8]) -> bool {
-        let h = self.hash(item);
-        let fp = self.fingerprint(h);
-
-        let i1 = self.index1(h);
-        let i2 = self.alt_index(i1, fp);
+        let (i1, i2, fp) = self.probe(item);
 
         // victim has what we need
         if let Some((victim_i1, victim_fp)) = self.victim {
@@ -294,11 +302,7 @@ impl<F: Fingerprint> Filter<F> {
     }
 
     fn insert(&mut self, item: &[u8]) -> Result<(), Full> {
-        let h = self.hash(item);
-        let fp = self.fingerprint(h);
-
-        let i1 = self.index1(h);
-        let i2 = self.alt_index(i1, fp);
+        let (i1, i2, fp) = self.probe(item);
 
         // try i1, then i2
         if self.bucket_insert(i1, fp) || self.bucket_insert(i2, fp) {
@@ -312,10 +316,8 @@ impl<F: Fingerprint> Filter<F> {
     }
 
     fn contains(&self, item: &[u8]) -> bool {
-        let h = self.hash(item);
-        let fp = self.fingerprint(h);
-        let i1 = self.index1(h);
-        let i2 = self.alt_index(i1, fp);
+        let (i1, i2, fp) = self.probe(item);
+
         // victim check
         if let Some((vb, vfp)) = self.victim {
             if vfp == fp && (vb == i1 || vb == i2) {
@@ -324,6 +326,11 @@ impl<F: Fingerprint> Filter<F> {
         }
 
         self.bucket_contains(i1, fp) || self.bucket_contains(i2, fp)
+    }
+
+    #[cfg(test)]
+    fn census(&self) -> usize {
+        self.table.iter().filter(|&&s| s != F::EMPTY).count() + usize::from(self.victim.is_some())
     }
 }
 
@@ -436,12 +443,14 @@ mod tests {
                 failed += 1;
             }
         }
-
         assert!(failed > 0, "expected saturation");
 
         let (CuckooFilter(Inner::Fp8(fa)), CuckooFilter(Inner::Fp8(fb))) = (&cf, &cf_alt) else {
             unreachable!()
         };
+
+        assert_eq!(fa.num_items, fa.census());
+        assert_eq!(fb.num_items, fb.census());
 
         assert_eq!(fa.table, fb.table);
         assert_eq!(fa.victim, fb.victim);
@@ -458,6 +467,8 @@ mod tests {
             unreachable!()
         };
 
+        assert_eq!(fa.num_items, fa.census());
+        assert_eq!(fb.num_items, fb.census());
         assert_eq!(fa.table, fb.table);
         assert_eq!(fa.victim, fb.victim);
         assert_eq!(fa.num_items, fb.num_items);
