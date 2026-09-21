@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-pub trait Fingerprint: Copy + Eq + Debug {
+pub(crate) trait Fingerprint: Copy + Eq + Debug {
     const EMPTY: Self; // 0 slot marker
     const BITS: u8;
     fn from_hash(h: u64) -> Self;
