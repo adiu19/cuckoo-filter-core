@@ -1,0 +1,314 @@
+use crate::filter::{Filter, Full};
+use crate::format::ImportError;
+
+#[derive(PartialEq, Debug)]
+pub enum BuildError {
+    ZeroCapacity,
+    ZeroBucketSize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CuckooFilter(Inner);
+
+#[derive(Debug, Clone)]
+enum Inner {
+    Fp8(Filter<u8>),
+    Fp16(Filter<u16>),
+}
+
+impl CuckooFilter {
+    pub fn with_seed_fp8(
+        capacity: usize,
+        bucket_size: usize,
+        max_kicks: u32,
+        seed: [u8; 16],
+    ) -> Result<Self, BuildError> {
+        if capacity == 0 {
+            return Err(BuildError::ZeroCapacity);
+        }
+
+        if bucket_size == 0 {
+            return Err(BuildError::ZeroBucketSize);
+        }
+
+        Ok(CuckooFilter(Inner::Fp8(Filter::<u8>::with_seed(
+            capacity.div_ceil(bucket_size).next_power_of_two(),
+            bucket_size,
+            max_kicks,
+            seed,
+        ))))
+    }
+
+    pub fn with_seed_fp16(
+        capacity: usize,
+        bucket_size: usize,
+        max_kicks: u32,
+        seed: [u8; 16],
+    ) -> Result<Self, BuildError> {
+        if capacity == 0 {
+            return Err(BuildError::ZeroCapacity);
+        }
+
+        if bucket_size == 0 {
+            return Err(BuildError::ZeroBucketSize);
+        }
+
+        Ok(CuckooFilter(Inner::Fp16(Filter::<u16>::with_seed(
+            capacity.div_ceil(bucket_size).next_power_of_two(),
+            bucket_size,
+            max_kicks,
+            seed,
+        ))))
+    }
+
+    /// Serializes the filter into the versioned byte format; see `Filter::export`
+    /// for the full layout.
+    pub fn export(&self) -> Vec<u8> {
+        match self {
+            CuckooFilter(Inner::Fp8(f)) => f.export(),
+            CuckooFilter(Inner::Fp16(f)) => f.export(),
+        }
+    }
+
+    pub fn import(bytes: &[u8]) -> Result<Self, ImportError> {
+        if bytes.len() < 4 {
+            return Err(ImportError::TooShort);
+        }
+
+        match bytes[3] {
+            8 => Ok(CuckooFilter(Inner::Fp8(Filter::<u8>::import(bytes)?))),
+            16 => Ok(CuckooFilter(Inner::Fp16(Filter::<u16>::import(bytes)?))),
+            v => Err(ImportError::UnsupportedFpBits(v)),
+        }
+    }
+
+    pub fn insert(&mut self, item: &[u8]) -> Result<(), Full> {
+        match self {
+            CuckooFilter(Inner::Fp8(f)) => f.insert(item),
+            CuckooFilter(Inner::Fp16(f)) => f.insert(item),
+        }
+    }
+
+    pub fn delete(&mut self, item: &[u8]) -> bool {
+        match self {
+            CuckooFilter(Inner::Fp8(f)) => f.delete(item),
+            CuckooFilter(Inner::Fp16(f)) => f.delete(item),
+        }
+    }
+
+    #[must_use]
+    pub fn count(&self, item: &[u8]) -> usize {
+        match self {
+            CuckooFilter(Inner::Fp8(f)) => f.count(item),
+            CuckooFilter(Inner::Fp16(f)) => f.count(item),
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            CuckooFilter(Inner::Fp8(f)) => f.num_items,
+            CuckooFilter(Inner::Fp16(f)) => f.num_items,
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[must_use]
+    pub fn contains(&self, item: &[u8]) -> bool {
+        match self {
+            CuckooFilter(Inner::Fp8(f)) => f.contains(item),
+            CuckooFilter(Inner::Fp16(f)) => f.contains(item),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SEED: [u8; 16] = [7u8; 16];
+
+    #[test]
+    fn u8_build_failure() {
+        assert_eq!(
+            BuildError::ZeroCapacity,
+            CuckooFilter::with_seed_fp8(0, 1, 2, SEED).err().unwrap()
+        );
+
+        assert_eq!(
+            BuildError::ZeroBucketSize,
+            CuckooFilter::with_seed_fp8(2, 0, 2, SEED).err().unwrap()
+        );
+    }
+
+    #[test]
+    fn u16_build_failure() {
+        assert_eq!(
+            BuildError::ZeroCapacity,
+            CuckooFilter::with_seed_fp16(0, 1, 2, SEED).err().unwrap()
+        );
+
+        assert_eq!(
+            BuildError::ZeroBucketSize,
+            CuckooFilter::with_seed_fp16(2, 0, 2, SEED).err().unwrap()
+        );
+    }
+
+    #[test]
+    fn u8_insert_b2() {
+        let mut cf8 = CuckooFilter::with_seed_fp8(8, 2, 2, SEED).unwrap();
+
+        // fill upto 75%
+        for item in 1u64..7u64 {
+            assert!(cf8.insert(&item.to_le_bytes()).is_ok());
+        }
+
+        assert_eq!(6, cf8.len());
+
+        for item in 1u64..7u64 {
+            assert!(cf8.contains(&item.to_le_bytes()));
+        }
+    }
+
+    #[test]
+    fn u8_insert_b4() {
+        let mut cf8 = CuckooFilter::with_seed_fp8(8, 4, 2, SEED).unwrap();
+
+        // fill upto 75%
+        for item in 1u64..7u64 {
+            assert!(cf8.insert(&item.to_le_bytes()).is_ok());
+        }
+
+        assert_eq!(6, cf8.len());
+
+        for item in 1u64..7u64 {
+            assert!(cf8.contains(&item.to_le_bytes()));
+        }
+    }
+
+    #[test]
+    fn u8_delete_b4() {
+        let mut cf8 = CuckooFilter::with_seed_fp8(8, 4, 2, SEED).unwrap();
+
+        // fill upto 75%
+        for item in 1u64..7u64 {
+            assert!(cf8.insert(&item.to_le_bytes()).is_ok());
+        }
+
+        assert_eq!(6, cf8.len());
+
+        for item in 1u64..3u64 {
+            assert!(cf8.delete(&item.to_le_bytes()));
+        }
+
+        assert_eq!(4, cf8.len());
+
+        for item in 3u64..7u64 {
+            assert!(cf8.contains(&item.to_le_bytes()));
+        }
+    }
+
+    #[test]
+    fn u8_count_b4() {
+        let mut cf8 = CuckooFilter::with_seed_fp8(8, 4, 2, SEED).unwrap();
+
+        // insert 1u64 4 times
+        let item = 1u64.to_le_bytes();
+        for _ in 0..4 {
+            assert!(cf8.insert(&item).is_ok());
+        }
+
+        assert_eq!(4, cf8.len());
+        assert_eq!(4, cf8.count(&item));
+
+        for _ in 0..2 {
+            assert!(cf8.delete(&item));
+        }
+
+        assert_eq!(2, cf8.len());
+        assert_eq!(2, cf8.count(&item));
+
+        // 2u64 is never inserted, so it's count should be 0
+        assert_eq!(0, cf8.count(&2u64.to_le_bytes()));
+    }
+
+    #[test]
+    fn identical_sequences_produce_identical_tables() {
+        let mut cf = CuckooFilter::with_seed_fp8(256, 4, 100, SEED).unwrap();
+        let mut cf_alt = CuckooFilter::with_seed_fp8(256, 4, 100, SEED).unwrap();
+
+        let mut failed = 0;
+        for item in 0u64..300 {
+            let ra = cf.insert(&item.to_le_bytes());
+            let rb = cf_alt.insert(&item.to_le_bytes());
+
+            assert_eq!(ra.is_ok(), rb.is_ok(), "diverged at item {item}");
+
+            if ra.is_err() {
+                failed += 1;
+            }
+        }
+        assert!(failed > 0, "expected saturation");
+
+        let (CuckooFilter(Inner::Fp8(fa)), CuckooFilter(Inner::Fp8(fb))) = (&cf, &cf_alt) else {
+            unreachable!()
+        };
+
+        assert_eq!(fa.num_items, fa.census());
+        assert_eq!(fb.num_items, fb.census());
+
+        assert_eq!(fa.table, fb.table);
+        assert_eq!(fa.victim, fb.victim);
+        assert_eq!(fa.num_items, fb.num_items);
+
+        for item in 0u64..50 {
+            let ra = cf.delete(&item.to_le_bytes());
+            let rb = cf_alt.delete(&item.to_le_bytes());
+
+            assert_eq!(ra, rb, "deletion diverged at item {item}");
+        }
+
+        let (CuckooFilter(Inner::Fp8(fa)), CuckooFilter(Inner::Fp8(fb))) = (&cf, &cf_alt) else {
+            unreachable!()
+        };
+
+        assert_eq!(fa.num_items, fa.census());
+        assert_eq!(fb.num_items, fb.census());
+        assert_eq!(fa.table, fb.table);
+        assert_eq!(fa.victim, fb.victim);
+        assert_eq!(fa.num_items, fb.num_items);
+    }
+
+    #[test]
+    fn export_import_roundtrip() {
+        let mut cf = CuckooFilter::with_seed_fp8(256, 4, 100, SEED).unwrap();
+
+        let mut failed = 0;
+        for item in 0u64..300 {
+            let ra = cf.insert(&item.to_le_bytes());
+            if ra.is_err() {
+                failed += 1;
+            }
+        }
+        assert!(failed > 0, "expected saturation");
+
+        let bytes = cf.export();
+        let cf_alt = CuckooFilter::import(&bytes).unwrap();
+
+        assert_eq!(cf_alt.export(), bytes);
+
+        let (CuckooFilter(Inner::Fp8(fa)), CuckooFilter(Inner::Fp8(fb))) = (&cf, &cf_alt) else {
+            unreachable!()
+        };
+
+        assert_eq!(fa.num_items, fa.census());
+        assert_eq!(fb.num_items, fb.census());
+        assert_eq!(fa.table, fb.table);
+        assert_eq!(fa.victim, fb.victim);
+        assert_eq!(fa.num_items, fb.num_items);
+    }
+}

@@ -63,3 +63,14 @@ impl Fingerprint for u16 {
         res
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn u16_uses_full_width() {
+        // a hash with high byte set in its low 16 bits must survive
+        assert_eq!(<u16 as Fingerprint>::from_hash(0xAB00), 0xAB00);
+        assert_eq!(<u8 as Fingerprint>::from_hash(0xAB00), 1); // low byte 0 -> bumped
+    }
+}
